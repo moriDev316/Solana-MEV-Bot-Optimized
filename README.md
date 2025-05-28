@@ -135,13 +135,6 @@ Contributions are welcome! If you'd like to contribute, please follow these step
 ## 📞 Contact Information
 For questions, feedback, or collaboration opportunities, feel free to reach out:
 
-<div align="left">
-
-📧 **Email**: [bitbanana717@gmail.com](mailto:bitbanana717@gmail.com)  
-📱 **Telegram**: [@bitfancy](https://t.me/bitfancy)  
-🎮 **Discord**: [@bitbanana717](https://discord.com/users/bitbanana717)  
-
-</div>
 
 ---
 
