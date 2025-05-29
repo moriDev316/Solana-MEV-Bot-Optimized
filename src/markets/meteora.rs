@@ -154,59 +154,99 @@ pub async fn fetch_data_meteora() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 
-pub async fn fetch_new_meteora_pools(rpc_client: &RpcClient, token: String, on_tokena: bool) -> Vec<(Pubkey, Market)> {
-
-    let meteora_program = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo".to_string();
-    // let pool = "5nRheYVXMTHEJXyAYG9KsUsXDTzvj9Las8M6NfNojaR".to_string();
-    // println!("DEBUG ---- Token: {:?}", token);
+pub async fn fetch_new_meteora_pools(
+    rpc_client: &RpcClient, 
+    token: String, 
+    on_tokena: bool
+) -> Result<Vec<(Pubkey, Market)>, Box<dyn std::error::Error>> {
     
-    let mut new_markets: Vec<(Pubkey, Market)> = Vec::new(); 
-    let filters = Some(vec![
+    const METEORA_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
+    const METEORA_ACCOUNT_SIZE: u64 = 904;
+    const TOKEN_A_OFFSET: usize = 88;
+    const TOKEN_B_OFFSET: usize = 120;
+    
+    info!("Fetching new Meteora pools for token: {} (position: {})", 
+          token, if on_tokena { "A" } else { "B" });
+    
+    // Parse program ID once
+    let program_id = from_str(METEORA_PROGRAM_ID)
+        .map_err(|e| format!("Invalid Meteora program ID: {}", e))?;
+    
+    // Build RPC filters
+    let filters = vec![
         RpcFilterType::Memcmp(Memcmp::new(
-            if on_tokena == true {
-                88
-            } else {
-                120
-            },
-          MemcmpEncodedBytes::Base58(token.clone()),
+            if on_tokena { TOKEN_A_OFFSET } else { TOKEN_B_OFFSET },
+            MemcmpEncodedBytes::Base58(token.clone()),
         )),
-        RpcFilterType::DataSize(904), 
-    ]);
+        RpcFilterType::DataSize(METEORA_ACCOUNT_SIZE),
+    ];
     
-    let accounts = rpc_client.get_program_accounts_with_config(
-        &from_str(&meteora_program).unwrap(),
-        RpcProgramAccountsConfig {
-            filters,
-            account_config: RpcAccountInfoConfig {
-                encoding: Some(UiAccountEncoding::Base64),
-                commitment: Some(rpc_client.commitment()),
-                ..RpcAccountInfoConfig::default()
-            },
-            ..RpcProgramAccountsConfig::default()
+    let config = RpcProgramAccountsConfig {
+        filters: Some(filters),
+        account_config: RpcAccountInfoConfig {
+            encoding: Some(UiAccountEncoding::Base64),
+            commitment: Some(rpc_client.commitment()),
+            ..RpcAccountInfoConfig::default()
         },
-    ).unwrap();
-
-    for account in accounts.clone() {
-        // println!("Address: {:?}", &account.0);
-        // println!("account data: {:?}", &account.1.data);
-        let meteora_market = AccountData::try_from_slice(&account.1.data).unwrap();
-        // println!("meteora_market: {:?}", meteora_market);
-        let market: Market = Market {
-            tokenMintA: from_Pubkey(meteora_market.token_xmint.clone()),
-            tokenVaultA: from_Pubkey(meteora_market.reserve_x.clone()),
-            tokenMintB: from_Pubkey(meteora_market.token_ymint.clone()),
-            tokenVaultB: from_Pubkey(meteora_market.reserve_y.clone()),
-            dexLabel: DexLabel::METEORA,
-            fee: 0 as u64,        
-            id: from_Pubkey(account.0).clone(),
-            account_data: Some(account.1.data),
-            liquidity: Some(666 as u64),
-        };
-        new_markets.push((account.0, market));
+        ..RpcProgramAccountsConfig::default()
+    };
+    
+    // Fetch accounts from RPC
+    let accounts = rpc_client
+        .get_program_accounts_with_config(&program_id, config)
+        .map_err(|e| format!("Failed to fetch Meteora accounts: {}", e))?;
+    
+    info!("Found {} potential Meteora pools", accounts.len());
+    
+    // Process accounts and build markets
+    let mut new_markets = Vec::with_capacity(accounts.len());
+    let mut successful_parses = 0;
+    
+    for (pubkey, account) in accounts {
+        match AccountData::try_from_slice(&account.data) {
+            Ok(meteora_data) => {
+                let market = Market {
+                    tokenMintA: from_Pubkey(meteora_data.token_xmint),
+                    tokenVaultA: from_Pubkey(meteora_data.reserve_x),
+                    tokenMintB: from_Pubkey(meteora_data.token_ymint),
+                    tokenVaultB: from_Pubkey(meteora_data.reserve_y),
+                    dexLabel: DexLabel::METEORA,
+                    fee: calculate_meteora_fee(&meteora_data),
+                    id: from_Pubkey(pubkey),
+                    account_data: Some(account.data),
+                    liquidity: calculate_meteora_liquidity(&meteora_data),
+                };
+                
+                new_markets.push((pubkey, market));
+                successful_parses += 1;
+            }
+            Err(e) => {
+                error!("Failed to parse Meteora account data for {}: {}", pubkey, e);
+                continue;
+            }
+        }
     }
-    // println!("Accounts: {:?}", accounts);
-    // println!("new_markets: {:?}", new_markets);
-    return new_markets;
+    
+    info!("Successfully parsed {}/{} Meteora pools", successful_parses, accounts.len());
+    Ok(new_markets)
+}
+
+// Helper function to calculate actual fee from Meteora account data
+fn calculate_meteora_fee(meteora_data: &AccountData) -> u64 {
+    // Use base fee from static parameters
+    meteora_data.parameters.base_factor as u64
+}
+
+// Helper function to calculate liquidity from reserves
+fn calculate_meteora_liquidity(meteora_data: &AccountData) -> Option<u64> {
+    // This is a placeholder - you might want to implement actual liquidity calculation
+    // based on the protocol fee amounts or other data
+    let total_fees = meteora_data.protocol_fee.amount_x + meteora_data.protocol_fee.amount_y;
+    if total_fees > 0 {
+        Some(total_fees)
+    } else {
+        None
+    }
 }
 
 
