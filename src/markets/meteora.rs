@@ -212,52 +212,82 @@ pub async fn fetch_new_meteora_pools(rpc_client: &RpcClient, token: String, on_t
 
 // Simulate one route 
 // I want to get the data of the market i'm interested in this route
-pub async fn simulate_route_meteora(printing_amt: bool, amount_in: u64, route: Route, market: Market, tokens_infos: HashMap<String, TokenInfos>) -> Result<(String, String), Box<dyn std::error::Error>> {
-    // println!("account_data: {:?}", &market.account_data.clone().unwrap());
-    // println!("market: {:?}", market.clone());
-    // let meteora_data = AccountData::try_from_slice(&market.account_data.expect("Account data problem // METEORA")).expect("Account data not fit bytes length");
-
-    let token0 = tokens_infos.get(&market.tokenMintA).unwrap();
-    let token1 = tokens_infos.get(&market.tokenMintB).unwrap();
-
-    let amount_in_uint = amount_in as u64;
-
+pub async fn simulate_route_meteora(
+    printing_amt: bool, 
+    amount_in: u64, 
+    route: Route, 
+    market: Market, 
+    tokens_infos: HashMap<String, TokenInfos>
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    
+    // Get token information with better error handling
+    let token0 = tokens_infos.get(&market.tokenMintA)
+        .ok_or_else(|| format!("Token info not found for mint A: {}", market.tokenMintA))?;
+    let token1 = tokens_infos.get(&market.tokenMintB)
+        .ok_or_else(|| format!("Token info not found for mint B: {}", market.tokenMintB))?;
+    
+    // Determine input/output tokens based on swap direction
+    let (input_token, output_token) = if route.token_0to1 {
+        (token0, token1)
+    } else {
+        (token1, token0)
+    };
+    
+    // Build query parameters using a more readable approach
     let params = format!(
         "poolId={}&token0to1={}&amountIn={}&tokenInSymbol={}&tokenOutSymbol={}",
         market.id,
         route.token_0to1,
-        amount_in_uint,
-        if route.token_0to1 == true { token0.clone().symbol } else { token1.clone().symbol },
-        if route.token_0to1 == true { token1.clone().symbol } else { token0.clone().symbol },
+        amount_in,
+        input_token.symbol,
+        output_token.symbol
     );
-
-    // Simulate a swap
-    let env = Env::new();
-    let domain = env.simulator_url;
-
-    let req_url = format!("{}meteora_quote?{}", domain, params);
-    let res = make_request(req_url).await?;
-    let res_text = res.text().await?;
     
-    if let Ok(json_value) = serde_json::from_str::<SimulationRes>(&res_text) {
-        if printing_amt {
-            println!("estimatedAmountIn: {:?} {:?}", json_value.amountIn, if route.token_0to1 == true { token0.clone().symbol } else { token1.clone().symbol });
-            println!("estimatedAmountOut: {:?} {:?}", json_value.estimatedAmountOut, if route.token_0to1 == true { token1.clone().symbol } else { token0.clone().symbol });
-            println!("estimatedMinAmountOut: {:?} {:?}", json_value.estimatedMinAmountOut.clone().unwrap(), if route.token_0to1 == true { token1.clone().symbol } else { token0.clone().symbol });
+    // Get environment and build request URL
+    let env = Env::new();
+    let req_url = format!("{}meteora_quote?{}", env.simulator_url, params);
+    
+    // Log the request for debugging (optional)
+    if printing_amt {
+        info!("Simulating Meteora swap: {} {} -> {}", amount_in, input_token.symbol, output_token.symbol);
+    }
+    
+    // Make the API request
+    let response = make_request(req_url).await?;
+    let response_text = response.text().await?;
+    
+    // Parse response with improved error handling
+    match serde_json::from_str::<SimulationRes>(&response_text) {
+        Ok(simulation_result) => {
+            // Print results if requested
+            if printing_amt {
+                println!("Meteora Simulation Results:");
+                println!("  Amount In: {} {}", simulation_result.amountIn, input_token.symbol);
+                println!("  Estimated Out: {} {}", simulation_result.estimatedAmountOut, output_token.symbol);
+                
+                if let Some(min_out) = &simulation_result.estimatedMinAmountOut {
+                    println!("  Min Amount Out: {} {}", min_out, output_token.symbol);
+                }
+            }
             
-        }    
-        return Ok((json_value.estimatedAmountOut, json_value.estimatedMinAmountOut.unwrap_or_default()))
-    } else if let Ok(error_value) = serde_json::from_str::<SimulationError>(&res_text) {
-        // println!("ERROR Value: {:?}", error_value.error);
-        Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            error_value.error,
-        )))
-    } else {
-        Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Unexpected response format",
-        )))
+            let min_amount_out = simulation_result.estimatedMinAmountOut
+                .unwrap_or_else(|| simulation_result.estimatedAmountOut.clone());
+            
+            Ok((simulation_result.estimatedAmountOut, min_amount_out))
+        }
+        Err(_) => {
+            // Try parsing as error response
+            match serde_json::from_str::<SimulationError>(&response_text) {
+                Ok(error_response) => {
+                    Err(format!("Meteora simulation failed: {}", error_response.error).into())
+                }
+                Err(_) => {
+                    // Log the raw response for debugging
+                    error!("Unexpected response format from Meteora API: {}", response_text);
+                    Err("Failed to parse Meteora simulation response".into())
+                }
+            }
+        }
     }
 }
 
