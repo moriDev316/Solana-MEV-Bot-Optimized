@@ -154,110 +154,180 @@ pub async fn fetch_data_meteora() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 
-pub async fn fetch_new_meteora_pools(rpc_client: &RpcClient, token: String, on_tokena: bool) -> Vec<(Pubkey, Market)> {
-
-    let meteora_program = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo".to_string();
-    // let pool = "5nRheYVXMTHEJXyAYG9KsUsXDTzvj9Las8M6NfNojaR".to_string();
-    // println!("DEBUG ---- Token: {:?}", token);
+pub async fn fetch_new_meteora_pools(
+    rpc_client: &RpcClient, 
+    token: String, 
+    on_tokena: bool
+) -> Result<Vec<(Pubkey, Market)>, Box<dyn std::error::Error>> {
     
-    let mut new_markets: Vec<(Pubkey, Market)> = Vec::new(); 
-    let filters = Some(vec![
+    const METEORA_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
+    const METEORA_ACCOUNT_SIZE: u64 = 904;
+    const TOKEN_A_OFFSET: usize = 88;
+    const TOKEN_B_OFFSET: usize = 120;
+    
+    info!("Fetching new Meteora pools for token: {} (position: {})", 
+          token, if on_tokena { "A" } else { "B" });
+    
+    // Parse program ID once
+    let program_id = from_str(METEORA_PROGRAM_ID)
+        .map_err(|e| format!("Invalid Meteora program ID: {}", e))?;
+    
+    // Build RPC filters
+    let filters = vec![
         RpcFilterType::Memcmp(Memcmp::new(
-            if on_tokena == true {
-                88
-            } else {
-                120
-            },
-          MemcmpEncodedBytes::Base58(token.clone()),
+            if on_tokena { TOKEN_A_OFFSET } else { TOKEN_B_OFFSET },
+            MemcmpEncodedBytes::Base58(token.clone()),
         )),
-        RpcFilterType::DataSize(904), 
-    ]);
+        RpcFilterType::DataSize(METEORA_ACCOUNT_SIZE),
+    ];
     
-    let accounts = rpc_client.get_program_accounts_with_config(
-        &from_str(&meteora_program).unwrap(),
-        RpcProgramAccountsConfig {
-            filters,
-            account_config: RpcAccountInfoConfig {
-                encoding: Some(UiAccountEncoding::Base64),
-                commitment: Some(rpc_client.commitment()),
-                ..RpcAccountInfoConfig::default()
-            },
-            ..RpcProgramAccountsConfig::default()
+    let config = RpcProgramAccountsConfig {
+        filters: Some(filters),
+        account_config: RpcAccountInfoConfig {
+            encoding: Some(UiAccountEncoding::Base64),
+            commitment: Some(rpc_client.commitment()),
+            ..RpcAccountInfoConfig::default()
         },
-    ).unwrap();
-
-    for account in accounts.clone() {
-        // println!("Address: {:?}", &account.0);
-        // println!("account data: {:?}", &account.1.data);
-        let meteora_market = AccountData::try_from_slice(&account.1.data).unwrap();
-        // println!("meteora_market: {:?}", meteora_market);
-        let market: Market = Market {
-            tokenMintA: from_Pubkey(meteora_market.token_xmint.clone()),
-            tokenVaultA: from_Pubkey(meteora_market.reserve_x.clone()),
-            tokenMintB: from_Pubkey(meteora_market.token_ymint.clone()),
-            tokenVaultB: from_Pubkey(meteora_market.reserve_y.clone()),
-            dexLabel: DexLabel::METEORA,
-            fee: 0 as u64,        
-            id: from_Pubkey(account.0).clone(),
-            account_data: Some(account.1.data),
-            liquidity: Some(666 as u64),
-        };
-        new_markets.push((account.0, market));
+        ..RpcProgramAccountsConfig::default()
+    };
+    
+    // Fetch accounts from RPC
+    let accounts = rpc_client
+        .get_program_accounts_with_config(&program_id, config)
+        .map_err(|e| format!("Failed to fetch Meteora accounts: {}", e))?;
+    
+    info!("Found {} potential Meteora pools", accounts.len());
+    
+    // Process accounts and build markets
+    let mut new_markets = Vec::with_capacity(accounts.len());
+    let mut successful_parses = 0;
+    
+    for (pubkey, account) in accounts {
+        match AccountData::try_from_slice(&account.data) {
+            Ok(meteora_data) => {
+                let market = Market {
+                    tokenMintA: from_Pubkey(meteora_data.token_xmint),
+                    tokenVaultA: from_Pubkey(meteora_data.reserve_x),
+                    tokenMintB: from_Pubkey(meteora_data.token_ymint),
+                    tokenVaultB: from_Pubkey(meteora_data.reserve_y),
+                    dexLabel: DexLabel::METEORA,
+                    fee: calculate_meteora_fee(&meteora_data),
+                    id: from_Pubkey(pubkey),
+                    account_data: Some(account.data),
+                    liquidity: calculate_meteora_liquidity(&meteora_data),
+                };
+                
+                new_markets.push((pubkey, market));
+                successful_parses += 1;
+            }
+            Err(e) => {
+                error!("Failed to parse Meteora account data for {}: {}", pubkey, e);
+                continue;
+            }
+        }
     }
-    // println!("Accounts: {:?}", accounts);
-    // println!("new_markets: {:?}", new_markets);
-    return new_markets;
+    
+    info!("Successfully parsed {}/{} Meteora pools", successful_parses, accounts.len());
+    Ok(new_markets)
+}
+
+// Helper function to calculate actual fee from Meteora account data
+fn calculate_meteora_fee(meteora_data: &AccountData) -> u64 {
+    // Use base fee from static parameters
+    meteora_data.parameters.base_factor as u64
+}
+
+// Helper function to calculate liquidity from reserves
+fn calculate_meteora_liquidity(meteora_data: &AccountData) -> Option<u64> {
+    // This is a placeholder - you might want to implement actual liquidity calculation
+    // based on the protocol fee amounts or other data
+    let total_fees = meteora_data.protocol_fee.amount_x + meteora_data.protocol_fee.amount_y;
+    if total_fees > 0 {
+        Some(total_fees)
+    } else {
+        None
+    }
 }
 
 
 // Simulate one route 
 // I want to get the data of the market i'm interested in this route
-pub async fn simulate_route_meteora(printing_amt: bool, amount_in: u64, route: Route, market: Market, tokens_infos: HashMap<String, TokenInfos>) -> Result<(String, String), Box<dyn std::error::Error>> {
-    // println!("account_data: {:?}", &market.account_data.clone().unwrap());
-    // println!("market: {:?}", market.clone());
-    // let meteora_data = AccountData::try_from_slice(&market.account_data.expect("Account data problem // METEORA")).expect("Account data not fit bytes length");
-
-    let token0 = tokens_infos.get(&market.tokenMintA).unwrap();
-    let token1 = tokens_infos.get(&market.tokenMintB).unwrap();
-
-    let amount_in_uint = amount_in as u64;
-
+pub async fn simulate_route_meteora(
+    printing_amt: bool, 
+    amount_in: u64, 
+    route: Route, 
+    market: Market, 
+    tokens_infos: HashMap<String, TokenInfos>
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    
+    // Get token information with better error handling
+    let token0 = tokens_infos.get(&market.tokenMintA)
+        .ok_or_else(|| format!("Token info not found for mint A: {}", market.tokenMintA))?;
+    let token1 = tokens_infos.get(&market.tokenMintB)
+        .ok_or_else(|| format!("Token info not found for mint B: {}", market.tokenMintB))?;
+    
+    // Determine input/output tokens based on swap direction
+    let (input_token, output_token) = if route.token_0to1 {
+        (token0, token1)
+    } else {
+        (token1, token0)
+    };
+    
+    // Build query parameters using a more readable approach
     let params = format!(
         "poolId={}&token0to1={}&amountIn={}&tokenInSymbol={}&tokenOutSymbol={}",
         market.id,
         route.token_0to1,
-        amount_in_uint,
-        if route.token_0to1 == true { token0.clone().symbol } else { token1.clone().symbol },
-        if route.token_0to1 == true { token1.clone().symbol } else { token0.clone().symbol },
+        amount_in,
+        input_token.symbol,
+        output_token.symbol
     );
-
-    // Simulate a swap
-    let env = Env::new();
-    let domain = env.simulator_url;
-
-    let req_url = format!("{}meteora_quote?{}", domain, params);
-    let res = make_request(req_url).await?;
-    let res_text = res.text().await?;
     
-    if let Ok(json_value) = serde_json::from_str::<SimulationRes>(&res_text) {
-        if printing_amt {
-            println!("estimatedAmountIn: {:?} {:?}", json_value.amountIn, if route.token_0to1 == true { token0.clone().symbol } else { token1.clone().symbol });
-            println!("estimatedAmountOut: {:?} {:?}", json_value.estimatedAmountOut, if route.token_0to1 == true { token1.clone().symbol } else { token0.clone().symbol });
-            println!("estimatedMinAmountOut: {:?} {:?}", json_value.estimatedMinAmountOut.clone().unwrap(), if route.token_0to1 == true { token1.clone().symbol } else { token0.clone().symbol });
+    // Get environment and build request URL
+    let env = Env::new();
+    let req_url = format!("{}meteora_quote?{}", env.simulator_url, params);
+    
+    // Log the request for debugging (optional)
+    if printing_amt {
+        info!("Simulating Meteora swap: {} {} -> {}", amount_in, input_token.symbol, output_token.symbol);
+    }
+    
+    // Make the API request
+    let response = make_request(req_url).await?;
+    let response_text = response.text().await?;
+    
+    // Parse response with improved error handling
+    match serde_json::from_str::<SimulationRes>(&response_text) {
+        Ok(simulation_result) => {
+            // Print results if requested
+            if printing_amt {
+                println!("Meteora Simulation Results:");
+                println!("  Amount In: {} {}", simulation_result.amountIn, input_token.symbol);
+                println!("  Estimated Out: {} {}", simulation_result.estimatedAmountOut, output_token.symbol);
+                
+                if let Some(min_out) = &simulation_result.estimatedMinAmountOut {
+                    println!("  Min Amount Out: {} {}", min_out, output_token.symbol);
+                }
+            }
             
-        }    
-        return Ok((json_value.estimatedAmountOut, json_value.estimatedMinAmountOut.unwrap_or_default()))
-    } else if let Ok(error_value) = serde_json::from_str::<SimulationError>(&res_text) {
-        // println!("ERROR Value: {:?}", error_value.error);
-        Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            error_value.error,
-        )))
-    } else {
-        Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Unexpected response format",
-        )))
+            let min_amount_out = simulation_result.estimatedMinAmountOut
+                .unwrap_or_else(|| simulation_result.estimatedAmountOut.clone());
+            
+            Ok((simulation_result.estimatedAmountOut, min_amount_out))
+        }
+        Err(_) => {
+            // Try parsing as error response
+            match serde_json::from_str::<SimulationError>(&response_text) {
+                Ok(error_response) => {
+                    Err(format!("Meteora simulation failed: {}", error_response.error).into())
+                }
+                Err(_) => {
+                    // Log the raw response for debugging
+                    error!("Unexpected response format from Meteora API: {}", response_text);
+                    Err("Failed to parse Meteora simulation response".into())
+                }
+            }
+        }
     }
 }
 
