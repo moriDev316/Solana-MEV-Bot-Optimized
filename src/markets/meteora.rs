@@ -79,38 +79,80 @@ impl MeteoraDEX {
     }
 }
 
+use std::path::Path;
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
+
 pub async fn fetch_data_meteora() -> Result<(), Box<dyn std::error::Error>> {
-    let response = get("https://dlmm-api.meteora.ag/pair/all").await?;
-    // info!("response: {:?}", response);
-    // info!("response-status: {:?}", response.status().is_success());
-    if response.status().is_success() {
-        let data = response.text().await?;
-        
-        match serde_json::from_str::<Root>(&data) {
-            Ok(json) => {
-                let file = File::create("src/markets/cache/meteora-markets.json")?;
-                let mut writer = BufWriter::new(file);
-                writer.write_all(serde_json::to_string(&json)?.as_bytes())?;
-                writer.flush()?;
-                info!("Data written to 'meteora-markets.json' successfully.");
-            }
-            Err(e) => {
-                eprintln!("Failed to deserialize JSON: {:?}", e);
-                // Optionally, save the raw JSON data to inspect it manually
-                // let mut raw_file = File::create("src/markets/cache/meteora-markets-raw.json")?;
-                // let mut writer = BufWriter::new(raw_file);
-                // writer.write_all(data.as_bytes())?;
-                // writer.flush()?;
-                let result = print_json_segment("src/markets/cache/meteora-markets-raw.json", 3426919 - 100 as u64, 2000);
-                // raw_file.write_all(data.as_bytes())?;
-                // info!("Raw data written to 'meteora-markets-raw.json' for inspection.");
-            }
-        }
-    } else {
-        error!("Fetch of 'meteora-markets.json' not successful: {}", response.status());
+    const API_URL: &str = "https://dlmm-api.meteora.ag/pair/all";
+    const CACHE_FILE: &str = "src/markets/cache/meteora-markets.json";
+    const RAW_CACHE_FILE: &str = "src/markets/cache/meteora-markets-raw.json";
+    
+    info!("Fetching Meteora market data from API...");
+    
+    // Create cache directory if it doesn't exist
+    if let Some(parent) = Path::new(CACHE_FILE).parent() {
+        fs::create_dir_all(parent).await?;
     }
-    Ok(())
+    
+    let response = get(API_URL).await?;
+    
+    if !response.status().is_success() {
+        let error_msg = format!("API request failed with status: {}", response.status());
+        error!("{}", error_msg);
+        return Err(error_msg.into());
+    }
+    
+    let data = response.text().await?;
+    
+    // Validate that we received non-empty data
+    if data.trim().is_empty() {
+        let error_msg = "Received empty response from API";
+        error!("{}", error_msg);
+        return Err(error_msg.into());
+    }
+    
+    match serde_json::from_str::<Root>(&data) {
+        Ok(json) => {
+            // Write parsed JSON data
+            let serialized = serde_json::to_string_pretty(&json)?;
+            fs::write(CACHE_FILE, serialized).await?;
+            
+            info!("Successfully fetched and cached {} Meteora markets", json.len());
+            Ok(())
+        }
+        Err(e) => {
+            error!("Failed to deserialize JSON: {}", e);
+            
+            // Save raw data for debugging
+            fs::write(RAW_CACHE_FILE, &data).await?;
+            info!("Raw data saved to '{}' for inspection", RAW_CACHE_FILE);
+            
+            // Try to provide more specific error information
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) {
+                error!("JSON is valid but doesn't match expected structure");
+                if let Some(array) = value.as_array() {
+                    info!("Received array with {} items", array.len());
+                    if let Some(first_item) = array.first() {
+                        info!("First item structure: {}", serde_json::to_string_pretty(first_item)?);
+                    }
+                }
+            } else {
+                error!("Response is not valid JSON");
+                // Show first 500 characters of response for debugging
+                let preview = if data.len() > 500 {
+                    format!("{}...", &data[..500])
+                } else {
+                    data.clone()
+                };
+                error!("Response preview: {}", preview);
+            }
+            
+            Err(format!("Failed to parse Meteora API response: {}", e).into())
+        }
+    }
 }
+
 
 pub async fn fetch_new_meteora_pools(rpc_client: &RpcClient, token: String, on_tokena: bool) -> Vec<(Pubkey, Market)> {
 

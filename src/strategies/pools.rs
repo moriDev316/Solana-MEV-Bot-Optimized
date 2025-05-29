@@ -1,73 +1,150 @@
-use std::{collections::HashMap, thread::sleep, time};
-use log::info;
+use std::{collections::HashMap, time::Duration};
+use log::{info, debug, warn};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
+use tokio::time::sleep;
+use futures::future::join_all;
 use crate::{
-    arbitrage::types::TokenInArb, common::
-        constants::Env
-    , markets::{meteora::fetch_new_meteora_pools, orca_whirpools::fetch_new_orca_whirpools, raydium::fetch_new_raydium_pools, types::Market} 
+    arbitrage::types::TokenInArb,
+    common::constants::Env,
+    markets::{
+        meteora::fetch_new_meteora_pools,
+        orca_whirpools::fetch_new_orca_whirpools,
+        raydium::fetch_new_raydium_pools,
+        types::Market
+    }
 };
+
+#[derive(Debug, Clone)]
+struct ExchangeConfig {
+    name: &'static str,
+    fetch_fn: fn(&RpcClient, String, bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<(String, Market)>> + Send>>,
+    delay_ms: u64,
+}
 
 pub async fn get_fresh_pools(tokens: Vec<TokenInArb>) -> HashMap<String, Market> {
     let env = Env::new();
-    let rpc_client = RpcClient::new_with_commitment(env.rpc_url.as_str(), CommitmentConfig::confirmed());
-    let mut new_markets: HashMap<String, Market> = HashMap::new();
-    let mut count_new_pools = 0;
-
-    println!("Tokens: {:#?}", tokens);
-    for (i, token) in tokens.iter().enumerate() {
-        // Avoid fetch for the first token (often SOL)
-        if i == 0 {
-            continue;
+    let rpc_client = RpcClient::new_with_commitment(
+        env.rpc_url.as_str(), 
+        CommitmentConfig::confirmed()
+    );
+    
+    debug!("Starting pool discovery for {} tokens", tokens.len());
+    debug!("Tokens: {:#?}", tokens);
+    
+    let mut all_markets: HashMap<String, Market> = HashMap::new();
+    
+    // Skip the first token (often SOL) and process the rest
+    let tokens_to_process = &tokens[1..];
+    
+    for (i, token) in tokens_to_process.iter().enumerate() {
+        info!("Processing token {}/{}: {}", i + 1, tokens_to_process.len(), token.address);
+        
+        let token_markets = fetch_pools_for_token(&rpc_client, &token.address).await;
+        
+        let pools_added = token_markets.len();
+        all_markets.extend(token_markets);
+        
+        info!("Added {} pools for token {}", pools_added, token.address);
+        
+        // Add delay between tokens to avoid rate limiting
+        if i < tokens_to_process.len() - 1 {
+            sleep(Duration::from_millis(1000)).await;
         }
-        //Orca Whirpools 
-        println!("1 GetProgramAccounts Orca");
-        let orca_res_tokena = fetch_new_orca_whirpools(&rpc_client, token.address.clone(), false).await;
-        for orca_pool in orca_res_tokena {
-            new_markets.insert(orca_pool.0.to_string(), orca_pool.1);
-            count_new_pools += 1;
-        }
-        sleep(time::Duration::from_millis(2000));
-        println!("1 GetProgramAccounts Orca");
-
-        let orca_res_tokenb = fetch_new_orca_whirpools(&rpc_client, token.address.clone(), true).await;
-        for orca_pool in orca_res_tokenb {
-            new_markets.insert(orca_pool.0.to_string(), orca_pool.1);
-            count_new_pools += 1;
-        }
-        sleep(time::Duration::from_millis(2000));
-        println!("1 GetProgramAccounts Raydium");
-        //Raydium Markets 
-        let raydium_res_tokena = fetch_new_raydium_pools(&rpc_client, token.address.clone(), false).await;
-        for raydium_pool in raydium_res_tokena {
-            new_markets.insert(raydium_pool.0.to_string(), raydium_pool.1);
-            count_new_pools += 1;
-        }
-        sleep(time::Duration::from_millis(2000));
-        println!("1 GetProgramAccounts Raydium");
-        let raydium_res_tokenb = fetch_new_raydium_pools(&rpc_client, token.address.clone(), true).await;
-        for raydium_pool in raydium_res_tokenb {
-            new_markets.insert(raydium_pool.0.to_string(), raydium_pool.1);
-            count_new_pools += 1;
-        }
-        sleep(time::Duration::from_millis(2000));
-        println!("1 GetProgramAccounts Meteora");
-        //Meteora Markets 
-        let meteora_res_tokena = fetch_new_meteora_pools(&rpc_client, token.address.clone(), false).await;
-        for meteora_pool in meteora_res_tokena {
-            new_markets.insert(meteora_pool.0.to_string(), meteora_pool.1);
-            count_new_pools += 1;
-        }
-        sleep(time::Duration::from_millis(2000));
-        println!("1 GetProgramAccounts Meteora");
-        let meteora_res_tokenb = fetch_new_meteora_pools(&rpc_client, token.address.clone(), true).await;
-        for meteora_pool in meteora_res_tokenb {
-            new_markets.insert(meteora_pool.0.to_string(), meteora_pool.1);
-            count_new_pools += 1;
-        }
-        sleep(time::Duration::from_millis(2000));
     }
-    info!("⚠️⚠️ NO RAYDIUM_CLMM fresh pools !");
-    info!("⚠️⚠️ NO ORCA fresh pools !");
-    return new_markets;
+    
+    info!("Pool discovery completed. Total pools found: {}", all_markets.len());
+    warn!("Note: RAYDIUM_CLMM and some ORCA pool types are not included in this search");
+    
+    all_markets
+}
+
+async fn fetch_pools_for_token(rpc_client: &RpcClient, token_address: &str) -> HashMap<String, Market> {
+    let mut token_markets: HashMap<String, Market> = HashMap::new();
+    
+    // Define exchange configurations
+    let exchanges = [
+        ("Orca", fetch_new_orca_whirpools as fn(&RpcClient, String, bool) -> _),
+        ("Raydium", fetch_new_raydium_pools as fn(&RpcClient, String, bool) -> _),
+        ("Meteora", fetch_new_meteora_pools as fn(&RpcClient, String, bool) -> _),
+    ];
+    
+    for (exchange_name, fetch_fn) in exchanges {
+        debug!("Fetching {} pools for token {}", exchange_name, token_address);
+        
+        // Fetch pools where token is tokenA (false) and tokenB (true)
+        let results = fetch_pools_from_exchange(
+            rpc_client, 
+            token_address, 
+            fetch_fn, 
+            exchange_name
+        ).await;
+        
+        let pools_count = results.len();
+        token_markets.extend(results);
+        
+        debug!("Found {} {} pools for token {}", pools_count, exchange_name, token_address);
+        
+        // Rate limiting between exchanges
+        sleep(Duration::from_millis(500)).await;
+    }
+    
+    token_markets
+}
+
+async fn fetch_pools_from_exchange(
+    rpc_client: &RpcClient,
+    token_address: &str,
+    fetch_fn: fn(&RpcClient, String, bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<(String, Market)>> + Send>>,
+    exchange_name: &str,
+) -> HashMap<String, Market> {
+    let mut exchange_markets: HashMap<String, Market> = HashMap::new();
+    
+    // Fetch both token positions concurrently
+    let (tokena_results, tokenb_results) = tokio::join!(
+        fetch_fn(rpc_client, token_address.to_string(), false),
+        fetch_fn(rpc_client, token_address.to_string(), true)
+    );
+    
+    // Process tokenA results
+    for (pool_id, market) in tokena_results {
+        exchange_markets.insert(pool_id, market);
+    }
+    
+    // Process tokenB results
+    for (pool_id, market) in tokenb_results {
+        exchange_markets.insert(pool_id, market);
+    }
+    
+    exchange_markets
+}
+
+// Alternative concurrent version for better performance
+pub async fn get_fresh_pools_concurrent(tokens: Vec<TokenInArb>) -> HashMap<String, Market> {
+    let env = Env::new();
+    let rpc_client = RpcClient::new_with_commitment(
+        env.rpc_url.as_str(), 
+        CommitmentConfig::confirmed()
+    );
+    
+    debug!("Starting concurrent pool discovery for {} tokens", tokens.len());
+    
+    // Skip the first token and create futures for all remaining tokens
+    let token_futures = tokens[1..].iter().map(|token| {
+        fetch_pools_for_token(&rpc_client, &token.address)
+    });
+    
+    // Execute all token fetches concurrently
+    let results = join_all(token_futures).await;
+    
+    // Combine all results
+    let mut all_markets: HashMap<String, Market> = HashMap::new();
+    for token_markets in results {
+        all_markets.extend(token_markets);
+    }
+    
+    info!("Concurrent pool discovery completed. Total pools found: {}", all_markets.len());
+    warn!("Note: RAYDIUM_CLMM and some ORCA pool types are not included in this search");
+    
+    all_markets
 }
